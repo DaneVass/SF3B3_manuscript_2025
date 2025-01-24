@@ -1,0 +1,348 @@
+---
+title: "Nanopore splice analysis"
+output: html_notebook
+---
+
+Similar to Reimer et al. 2021 Mol Cell. 
+
+Classify reads as fully spliced, partially spliced or not spliced. 
+
+Nanopore splicing read classification logic 
+1. import bam as GAlignments
+2. import expressed genes as GRanges
+3. subset GAlignments to overlaps with expressed genes
+4. perform the follwoing on all reads at once
+	i. define overlapping splice junctions with junctions()
+	ii. define njunc with njunc()
+	iii. count overlapping introns with countOverlaps(introns)
+	iv. if read does not overlap an intron, continue, count number of these reads
+	v. classify reads based on spliced, unspliced or partially spliced:
+	vi. if njunc > 0 && n(intronOverlaps) > 0 && njunc == n(intronOverlaps) --> "spliced"
+	vii. if n(intronOverlaps) > 0 && njunc <= 0 && n(intronOverlaps) > njunc  --> "partially spliced"
+	vii. if n(intronOverlaps) > 0 && njunc == 0  --> "unspliced"
+5. return query reads and classification as data frame
+6. Aggregate into table and plot as replicate wise proportional barplot 
+
+## import libraries
+```{r}
+# Required Libraries
+library(Rsamtools)
+library(GenomicAlignments)
+library(GenomicFeatures)
+library(BRGenomics)
+library(BiocParallel)
+```
+
+## Load GTF file for reference annotations (exons and introns)
+```{r}
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene::TxDb.Hsapiens.UCSC.hg38.knownGene
+```
+
+## Extract genes, exons and introns from the reference annotation
+```{r}
+genes <- GenomicFeatures::genes(txdb)
+genes <- tidyChromosomes(genes, genome = "hg38")
+
+exons <- exonsBy(txdb, by = "gene")
+exons <- tidyChromosomes(exons@unlistData, keep.X = T, keep.Y = T, keep.M = F)
+
+introns <- intronsByTranscript(txdb, use.names = T)
+introns <- tidyChromosomes(introns@unlistData, keep.X = T, keep.Y = T, keep.M = F)
+#introns <- GenomicFeatures::intronicParts(txdb)
+```
+
+## convert refseq transcript IDs to ENSEMBL ids from major transcripts
+```{r}
+# load major isoform intron annotations
+load("~/annotations/human.refseq.major.isoform.intron.RData")
+
+# get list of transcript ID (refseq)
+major.tx <- unique(human.refseq.major.isoform.intron$transcript_id)
+
+## load hg38 transcript conversion table
+# downloaded from BioMart
+hg38.tx <- read.delim("../../annotations/hg38_transcript_annotations.txt", header = T)
+hg38.tx$Gene.stable.ID.version <- NULL
+hg38.tx$Transcript.stable.ID.version <- NULL
+colnames(hg38.tx) <- c("GeneID", "TranscriptID", "RefSeqID", "Symbol")
+hg38.tx$RefSeqID <- sub('\\..*', '', hg38.tx$RefSeqID)
+head(hg38.tx)
+
+# remove version number from ENSEMBL transcript name
+names(introns) <- sub('\\..*', '', names(introns))
+
+# match ENSEMBL intron transcript name to REFSEQ
+introns.refseq <- introns
+names(introns.refseq) <- hg38.tx[match(names(introns), hg38.tx$TranscriptID),"RefSeqID"]
+
+introns.refseq.major <- introns.refseq[which(names(introns.refseq) %in% major.tx)]
+introns.refseq.major.tidy <- tidyChromosomes(introns.refseq.major@unlistData)
+
+```
+
+## import expressed genes MANE annotations
+```{r}
+# import mane expressed gene locations
+mane <- import.bed("../../annotations/mane.expressed.prot.coding.genes.hg38.bed")
+
+# also import Q1 genes
+Q1.genes.mane <- import.bed("../../annotations/Q1.genes.bed")
+
+# test on a small subset
+Q1.genes.mane.subset <- Q1.genes.mane[1:20,]
+
+```
+
+# vectorised classify_reads function
+```{r}
+classify_reads <- function(bam, introns, regions.use = mane.expressed) {
+  require(GenomicAlignments)
+  require(dplyr)
+
+  # Read in the BAM file with specified parameters
+  params <- ScanBamParam(what = c("qname", "rname", "pos", "strand", "qwidth"), which = regions.use)
+  
+  message(paste("reading in", basename(bam)))
+  reads <- readGAlignments(bam, param = params)
+  
+  # Extract metadata for all reads at once
+  message(paste("extracting read info"))
+  read.names <- reads@elementMetadata$qname
+  chroms <- reads@elementMetadata$rname
+  starts <- start(reads)
+  ends <- end(reads)
+  strands <- strand(reads)
+  
+  # Calculate junctions and overlaps for all reads
+  message(paste("determining intron junctions"))
+  num.juncs <- njunc(reads)
+  intron_overlaps <- countOverlaps(granges(reads, use.mcols = TRUE), introns)
+  intron_overlap_alns <- countOverlaps(reads, introns)
+  
+  # Classify reads using vectorized logic
+  message(paste("classifying" ,length(reads), "reads"))
+  read.statuses <- case_when(
+    intron_overlaps > 0 & intron_overlaps == num.juncs & intron_overlap_alns == 0 ~ "fully_spliced",
+    intron_overlaps > 0 & num.juncs > 0 & intron_overlap_alns > 0 &
+      (num.juncs < intron_overlaps | intron_overlap_alns < intron_overlaps) ~ "partially_spliced",
+    intron_overlaps == 0 ~ "no_covered_introns",
+    TRUE ~ "not_spliced"
+  )
+  
+  # Create a data frame with results
+  result <- data.frame(
+    read = read.names,
+    chrom = chroms,
+    start = starts,
+    end = ends,
+    strand = strands,
+    status = read.statuses,
+    njunc = num.juncs,
+    range.overlap = intron_overlaps,
+    aln.overlap = intron_overlap_alns
+  )
+  
+  return(result)
+}
+
+```
+
+## run vectorised function for all samples 
+about 25 mins all up
+```{r}
+bams <- list.files("/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/bams_no_supp", pattern = "*.bam$", full.names = T)
+
+# start timer
+start_time <- Sys.time()
+
+# Apply classification function to the BAM file reads
+classified_reads <- lapply(bams, function(bam_path){
+  classify_reads(bam = bam_path, introns = introns.refseq.major.tidy, regions.use = Q1.genes.mane.subset)
+})
+end_time <- Sys.time()
+
+execution_time <- end_time - start_time
+print(execution_time)
+```
+
+## add sample names to list objects
+```{r}
+names <- list.files("/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/bams_no_supp", pattern = "*.bam$", full.names = F)
+names(classified_reads) <- str_split(names, pattern = "\\.", simplify = T)[,1]
+
+# add names as column to each table
+for (i in c(1:length(names))){
+  classified_reads[[i]]$sample <- names[i]
+}
+```
+
+## bind all tables with data.table
+```{r}
+library(data.table)
+all.samples.classified <- rbindlist(classified_reads)
+write_csv(all.samples.classified, "./all.samples.classified.csv") # save output
+```
+
+## generate summary data from table
+```{r}
+summary_data <- all.samples.classified %>% filter(status != "no_covered_introns") %>%
+  group_by(status, sample) %>%
+  summarise(total = n()) %>% group_by(sample) %>% mutate(proportion = total / sum(total))
+  
+summary_data$status <- factor(summary_data$status, levels = c("fully_spliced", "partially_spliced", "not_spliced"))
+
+summary_data$treat <- str_split(summary_data$sample, "_", simplify = T)[,1]
+summary_data$rep <- str_split(summary_data$sample, "_", simplify = T)[,2]
+```
+
+## plot stacked barplot - separate replicates
+```{r}
+# all reps
+summary_data %>% 
+  #filter(treat %in% c("ND", "dD")) %>% 
+  #filter(rep %in% c("R1", "R2")) %>%
+  ggplot(aes(x = sample, y = proportion, fill = status)) +
+    geom_histogram(stat = "identity") +
+    scale_fill_manual(values = ggpubr::get_palette("npg", 5)[c(4,2,5)]) +
+    theme_classic()
+
+# remove NP_R2
+summary_data %>% 
+  filter(sample != "NP_R2") %>% 
+  ggplot(aes(x = sample, y = proportion, fill = status)) +
+    geom_histogram(stat = "identity") +
+    scale_fill_manual(values = ggpubr::get_palette("npg", 5)[c(4,2,5)]) +
+    theme_classic() + facet_wrap(~ treat, drop = T, scales = "free_x")
+```
+
+## stacked barplots with mean and SD 
+```{r}
+summary_data_mean_sd <- summary_data %>%
+  filter(sample != "NP_R2") %>%
+  group_by(status, treat) %>%
+  summarise(
+    mean_proportion = mean(proportion, na.rm = TRUE),
+    sd_proportion = sd(proportion, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+point.dat <- summary_data %>% filter(treat %in% c("ND", "dD"))
+
+summary_data_mean_sd %>% filter(treat %in% c("ND", "dD")) %>% 
+  mutate(treat = factor(treat, levels = c("ND", "dD"))) %>%
+  ggplot(aes(x = status, y = mean_proportion, fill = treat), stat = "identity") +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.8) +
+  geom_point(data = point.dat, mapping = aes(x = status, y = proportion, color = treat)) +
+  geom_errorbar(
+    aes(ymin = mean_proportion - sd_proportion, 
+        ymax = mean_proportion + sd_proportion),
+    position = position_dodge(width = 0.9),
+    width = 0.25
+  ) +
+  scale_fill_manual(values = ggpubr::get_palette("npg", 5)[c(4,2,5, 1)]) +
+  theme_classic() +
+  #facet_wrap(~ status, scales = "free_x") +
+  labs(x = "Status", y = "Mean Proportion") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text.x = element_text(angle = 90, hjust = 0),
+    panel.spacing = unit(0.5, "lines")
+  )
+
+ggsave("./reads_classified_ND_dD.pdf", width = 4, height = 5.5)
+```
+
+## alternate read classifying logic
+```{r}
+all.samples.classified <- all.samples.classified %>% mutate(alt.status = case_when(
+    njunc > 0 & aln.overlap == 0 ~ "fully_spliced",
+    njunc > 0 & aln.overlap > 0 ~ "partially_spliced",
+    njunc == 0 & aln.overlap > 0 ~ "not_spliced",
+    TRUE ~ "no_covered_introns"
+  ))
+```
+
+
+## generate summary data from table
+```{r}
+summary_data_alt <- all.samples.classified %>% filter(alt.status != "no_covered_introns") %>%
+  group_by(alt.status, sample) %>%
+  summarise(total = n()) %>% group_by(sample) %>% mutate(proportion = total / sum(total))
+  
+summary_data_alt$alt.status <- factor(summary_data_alt$alt.status, levels = c("fully_spliced", "partially_spliced", "not_spliced"))
+
+summary_data_alt$treat <- str_split(summary_data_alt$sample, "_", simplify = T)[,1]
+summary_data_alt$rep <- str_split(summary_data_alt$sample, "_", simplify = T)[,2]
+```
+
+## plot stacked barplot - separate replicates
+```{r}
+# all reps
+summary_data_alt %>% 
+  #filter(treat %in% c("ND", "dD")) %>% 
+  #filter(rep %in% c("R1", "R2")) %>%
+  ggplot(aes(x = sample, y = proportion, fill = alt.status)) +
+    geom_histogram(stat = "identity") +
+    scale_fill_manual(values = ggpubr::get_palette("npg", 5)[c(4,2,5)]) +
+    theme_classic()
+ggsave("./reads_classified_alt_allreps.pdf", width = 4, height = 5.5)
+
+# all reps
+summary_data_alt %>% 
+  filter(treat %in% c("ND", "dD")) %>% 
+  filter(rep %in% c("R1", "R2")) %>%
+  ggplot(aes(x = sample, y = proportion, fill = alt.status)) +
+    geom_histogram(stat = "identity") +
+    scale_fill_manual(values = ggpubr::get_palette("npg", 5)[c(4,2,5)]) +
+    theme_classic()
+ggsave("./reads_classified_alt_R1-R2_ND-dD.pdf", width = 4, height = 5.5)
+
+
+# remove NP_R2
+summary_data_alt %>% 
+  filter(sample != "NP_R2") %>% 
+  ggplot(aes(x = sample, y = proportion, fill = alt.status)) +
+    geom_histogram(stat = "identity") +
+    scale_fill_manual(values = ggpubr::get_palette("npg", 5)[c(4,2,5)]) +
+    theme_classic() + facet_wrap(~ treat, drop = T, scales = "free_x")
+ggsave("./reads_classified_alt_facet-treat.pdf", width = 4, height = 5.5)
+```
+
+## stacked barplots with mean and SD 
+```{r}
+summary_data_alt_mean_sd <- summary_data_alt %>%
+  filter(sample != "NP_R2") %>%
+  group_by(alt.status, treat) %>%
+  summarise(
+    mean_proportion = mean(proportion, na.rm = TRUE),
+    sd_proportion = sd(proportion, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+point.dat <- summary_data_alt %>% filter(treat %in% c("ND", "dD"))
+
+summary_data_alt_mean_sd %>% filter(treat %in% c("ND", "dD")) %>% 
+  mutate(treat = factor(treat, levels = c("ND", "dD"))) %>%
+  ggplot(aes(x = alt.status, y = mean_proportion, fill = treat), stat = "identity") +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.8) +
+  geom_point(data = point.dat, mapping = aes(x = alt.status, y = proportion, color = treat)) +
+  geom_errorbar(
+    aes(ymin = mean_proportion - sd_proportion, 
+        ymax = mean_proportion + sd_proportion),
+    position = position_dodge(width = 0.9),
+    width = 0.25
+  ) +
+  scale_fill_manual(values = ggpubr::get_palette("npg", 5)[c(4,2,5, 1)]) +
+  theme_classic() +
+  #facet_wrap(~ alt.status, scales = "free_x") +
+  labs(x = "alt.status", y = "Mean Proportion") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text.x = element_text(angle = 90, hjust = 0),
+    panel.spacing = unit(0.5, "lines")
+  )
+
+ggsave("./reads_classified_alt_ND_dD.pdf", width = 4, height = 5.5)
+```
+
+    
