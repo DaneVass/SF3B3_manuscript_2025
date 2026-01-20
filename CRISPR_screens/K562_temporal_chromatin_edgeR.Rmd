@@ -1,0 +1,837 @@
+---
+title: "K562 MYC Chromatin Screen"
+output: html_document
+---
+#--------------------------------------------
+# K562 MYC Chromatin Screen
+#--------------------------------------------
+K562 MYC-mNeonGreen cells were transduced with the human chromatin focussed sgRNA library. 
+GFP low cells were enriched by FACS on days 3,4,5,6 post transduction and sequenced --> NEG fraction
+Timepoint matched LIB control fractions were taken at each timepoint. 
+MID fractions were also sorted and sequenced. 
+Two replicates were performed for both clone 32 and clone 58. Therefore n = 4
+
+BARtab v1.4 was used to extract and count sgRNAs from raw sequencing reads
+Resulting counts tables are imported here for CRISPR screen analysis using edgeR.
+
+---
+
+# Setup
+
+## import libraries
+```{r, message=FALSE, warning=FALSE}
+library(edgeR)
+library(bartools)
+library(tidyverse)
+library(ggpointdensity)
+library(viridis)
+library(reshape2)
+#library(MAGeCKFlute)
+library(RColorBrewer)
+```
+
+## setup output dirs
+```{r, message=FALSE, warning=FALSE}
+results.dir <- file.path(getwd(), "edgeR/results")
+dir.create(results.dir, showWarnings = F)
+
+plots.dir <- file.path(getwd(), "edgeR/plots")
+dir.create(plots.dir, showWarnings = F)
+```
+
+#------------------------------------------------
+# Setup DGEList object
+#------------------------------------------------
+
+## import counts files
+```{r}
+raw.counts <- read.delim("./K562_temporal_chromatin_raw_counts.tsv", header = T, sep = "\t", row.names = 1)
+colnames(raw.counts) <- gsub("X", "C", colnames(raw.counts))
+
+# separate count table per clone
+raw.counts.58 <- raw.counts[,grep("C58", colnames(raw.counts))]
+colnames(raw.counts.58) <- c("C58.R2.D5.NEG","C58.R1.D6.NEG","C58.R1.D4.LIB","C58.R1.D4.NEG","C58.R2.D4.MID","C58.R2.D5.MID","C58.R2.D3.NEG","C58.R2.D6.NEG","C58.R1.D5.NEG","C58.R2.D4.NEG","C58.R2.D6.MID","C58.R2.D3.MID","C58.R1.D5.LIB","C58.R2.D3.LIB","C58.R1.D6.LIB","C58.R2.D6.LIB","C58.R2.D4.LIB","C58.R2.D5.LIB")
+
+raw.counts.32 <- raw.counts[,grep("C32", colnames(raw.counts))]
+colnames(raw.counts.32) <- c("C32.R2.D6.MID","C32.R1.D4.NEG","C32.R2.D4.MID","C32.R2.D4.NEG","C32.R2.D5.NEG","C32.R2.D5.MID","C32.R1.D5.NEG","C32.R2.D3.MID","C32.R2.D6.NEG","C32.R1.D6.NEG","C32.R2.D3.NEG","C32.R1.D4.LIB","C32.R2.D3.LIB","C32.R2.D5.LIB","C32.R1.D6.LIB","C32.R2.D6.LIB")
+
+raw.counts <- cbind(raw.counts.32, raw.counts.58)
+raw.counts <- na.omit(raw.counts)
+```
+
+
+## generate metadata
+```{r}
+metadata <- as.data.frame(str_split(colnames(raw.counts), pattern = "\\.", simplify = T), row.names = colnames(raw.counts))
+colnames(metadata) <- c("Clone", "Replicate", "Day", "Group")
+
+# fix gene names
+genes <- as.data.frame(str_split(row.names(raw.counts), "_", simplify = T))
+sgRNAs <- as.data.frame(str_split(genes[,3], "\\.", simplify = T))
+genes$V4 <- sgRNAs$V2
+colnames(genes) <- c("Symbol", "ENSEMBL", "ENTREZ", "Guide")
+```
+
+## create DGEList
+```{r}
+dge <- DGEList(counts = as.matrix(raw.counts), samples = metadata, group = metadata$Group, genes = genes, remove.zeros = T)
+dge
+```
+
+## filter DGEList
+```{r}
+table(dge$samples$group)
+
+# Filter sgRNAs and samples with low counts Need a CPM greater than 5 in 15 or more samples
+# to keep sgRNAs
+selr = rowSums(cpm(dge$counts) > 5) >= 15
+# Need at least 100,000 reads to keep a given sample
+selc = colSums(dge$counts) >= 1e+05
+dge = dge[selr, selc]
+dim(dge)
+```
+
+## Plot counts per sample & guide
+```{r}
+# Set up drug treatment colours
+cols = as.numeric(dge$samples$group) + 1
+
+barplot(colSums(dge$counts), las = 2, main = "Counts per index", col = cols, cex.names = 0.5,
+cex.axis = 0.8)
+barplot(rowSums(dge$counts), las = 2, main = "Counts per sgRNA", cex.names = 0.5, cex.axis = 0.8)
+
+pdf(file.path(plots.dir, "K562_Chromatin_counts_per_sample_sgRNA.pdf"))
+barplot(colSums(dge$counts), las = 2, main = "Counts per index", col = cols, cex.names = 0.5,
+cex.axis = 0.8)
+barplot(rowSums(dge$counts), las = 2, main = "Counts per sgRNA", cex.names = 0.5, cex.axis = 0.8)
+dev.off()
+
+```
+#------------------------------------------------
+# NEG sample analysis - Combined clones
+#------------------------------------------------
+
+## MDS plot
+```{r}
+dge = calcNormFactors(dge, method = "none")
+
+# Make an MDS plot to visualise relationships between replicate samples Set up infection #
+# colours
+cols = as.numeric(factor(dge$samples$Group)) + 1
+cols2 = as.numeric(dge$samples$Clone) + 1
+cols3 = as.numeric(factor(dge$samples$Replicate)) + 1
+plotMDS(dge, col = cols, main = "MDS Plot")
+plotMDS(dge, col = cols, main = "MDS Plot", pch = 16)
+plotMDS(dge, col = cols2, main = "MDS Plot")
+plotMDS(dge, col = cols3, main = "MDS Plot")
+
+pdf(file.path(plots.dir, "K562_Chromatin_MDS_plots.pdf"))
+plotMDS(dge, col = cols, main = "MDS Plot")
+plotMDS(dge, col = cols, main = "MDS Plot", pch = 16)
+plotMDS(dge, col = cols2, main = "MDS Plot")
+plotMDS(dge, col = cols3, main = "MDS Plot")
+dev.off()
+```
+
+## Set up design matrix for GLM
+We will use GLMs in edgeR in this case since there are more than 2 groups 
+```{r}
+group = as.factor(dge$samples$group)
+replicate = as.factor(dge$samples$Replicate)
+timepoint = as.factor(dge$samples$Day)
+clone = as.factor(dge$samples$Clone)
+contrasts = as.factor(paste(timepoint,group, sep = '.'))
+des = model.matrix(~0+contrasts)
+colnames(des) <- levels(contrasts)
+des[1:5, ]
+```
+
+## Estimate dispersions
+```{r}
+xglm = estimateDisp(dge, des)
+sqrt(xglm$common.disp)
+```
+
+## Plot BCVs versus abundance
+```{r}
+plotBCV(xglm, main = "BCV Plot")
+
+pdf(file.path(plots.dir, "K562_Chromatin_BCV_plot.pdf"))
+plotBCV(xglm, main = "BCV Plot")
+dev.off()
+```
+
+## Fit negative bionomial GLM
+```{r}
+fit = glmQLFit(xglm, des)
+
+# define contrasts of interest
+my.contrasts <- makeContrasts(
+  D3 = D3.NEG-D3.LIB,
+  D4 = D4.NEG-D4.LIB,
+  D5 = D5.NEG-D5.LIB,
+  D6 = D6.NEG-D6.LIB,
+  levels = des)
+
+qlf.D3 <- glmQLFTest(fit, contrast=my.contrasts[,"D3"])
+write.csv(topTags(qlf.D3, n = Inf), file = file.path(results.dir, "K562_Chromatin_32_58_NEG_D3_toptags.csv"))
+
+qlf.D4 <- glmQLFTest(fit, contrast=my.contrasts[,"D4"])
+write.csv(topTags(qlf.D4, n = Inf), file = file.path(results.dir, "K562_Chromatin_32_58_NEG_D4_toptags.csv"))
+
+qlf.D5 <- glmQLFTest(fit, contrast=my.contrasts[,"D5"])
+write.csv(topTags(qlf.D5, n = Inf), file = file.path(results.dir, "K562_Chromatin_32_58_NEG_D5_toptags.csv"))
+
+qlf.D6 <- glmQLFTest(fit, contrast=my.contrasts[,"D6"])
+write.csv(topTags(qlf.D6, n = Inf), file = file.path(results.dir, "K562_Chromatin_32_58_NEG_D6_toptags.csv"))
+
+# LRT tests
+#lrt = glmLRT(fit, coef = 3)
+# Show top ranked sgRNAs
+#topTags(lrt)
+```
+
+## plot smear for D6
+```{r}
+# Select sgRNAs with FDR < 0.001 and logFC <= -1 to highlight on plot
+thresh = 0.01
+lfc = 1
+top4 = topTags(qlf.D6, n = Inf)
+top4ids = rownames(top4$table[top4$table$FDR < thresh & top4$table$logFC >= lfc,])
+# Plot logFC versus logCPM
+plotSmear(qlf.D6, de.tags = top4ids, pch = 20, cex = 0.6, main = "Large sgRNA-seq screen: logFC vs logCPM")
+abline(h = c(-1, 0, 1), col = c("dodgerblue", "yellow", "dodgerblue"), lty = 2)
+
+pdf(file.path(plots.dir, "32_58_NEG_D6_smear_plot.pdf"))
+plotSmear(qlf.D6, de.tags = top4ids, pch = 20, cex = 0.6, main = "Large sgRNA-seq screen: logFC vs logCPM")
+abline(h = c(-1, 0, 1), col = c("dodgerblue", "yellow", "dodgerblue"), lty = 2)
+dev.off()
+
+```
+
+#------------------------------------------------
+# Gene set testing
+#------------------------------------------------
+
+## setup gene list for camera
+```{r}
+genesymbols = dge$genes[,1]
+genesymbollist = list()
+unq = unique(genesymbols)
+unq = unq[!is.na(unq)]
+for (i in unq) {
+  sel = genesymbols == i & !is.na(genesymbols)
+  if (sum(sel) > 3){
+    genesymbollist[[i]] = which(sel)
+  }
+}
+
+write(unq, file = file.path(results.dir, "chrom_lib_genes.txt"))
+```
+
+## Run camera for all genes
+```{r}
+camera.res.D3 = camera(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D3"])
+camera.res.D3[camera.res.D3$FDR < 0.05,]
+
+camera.res.D4 = camera(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D4"])
+camera.res.D4[camera.res.D4$FDR < 0.05,]
+
+camera.res.D5 = camera(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D5"])
+camera.res.D5[camera.res.D5$FDR < 0.05,]
+
+camera.res.D6 = camera(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D6"])
+camera.res.D6[camera.res.D6$FDR < 0.05,]
+```
+
+## Run roast for all genes
+```{r}
+roast.res.D3 = roast(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D3"])
+roast.res.D3[roast.res.D3$FDR < 0.1,] %>% filter(Direction == "Up")
+
+roast.res.D4 = roast(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D4"])
+roast.res.D4[roast.res.D4$FDR < 0.1,] %>% filter(Direction == "Up")
+
+roast.res.D5 = roast(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D5"])
+roast.res.D5[roast.res.D5$FDR < 0.1,] %>% filter(Direction == "Up")
+
+roast.res.D6 = roast(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D6"])
+roast.res.D6[roast.res.D6$FDR < 0.1,] %>% filter(Direction == "Up")
+```
+
+## Run mroast for all genes
+```{r}
+mroast.res.D3 <- mroast(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D3"])
+mroast.res.D3[mroast.res.D3$FDR < 0.1,] %>% filter(Direction == "Up") %>% filter(PropUp > 0.4)
+
+mroast.res.D4 <- mroast(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D4"])
+mroast.res.D4[mroast.res.D4$FDR < 0.1,] %>% filter(Direction == "Up") %>% filter(PropUp > 0.4)
+
+mroast.res.D5 <- mroast(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D5"])
+mroast.res.D5[mroast.res.D5$FDR < 0.1,] %>% filter(Direction == "Up") %>% filter(PropUp > 0.4)
+
+mroast.res.D6 <- mroast(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D6"])
+mroast.res.D6[mroast.res.D6$FDR < 0.1,] %>% filter(Direction == "Up") %>% filter(PropUp > 0.4)
+
+```
+
+## Run fry for all genes
+```{r}
+fry.res.D3 <- fry(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D3"], sort = "directional")
+fry.res.D3[fry.res.D3$FDR < 0.3,] %>% filter(Direction == "Up")
+
+fry.res.D4 <- fry(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D4"], sort = "directional")
+fry.res.D4[fry.res.D4$FDR < 0.3,] %>% filter(Direction == "Up")
+
+fry.res.D5 <- fry(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D5"], sort = "directional")
+fry.res.D5[fry.res.D5$FDR < 0.3,] %>% filter(Direction == "Up")
+
+fry.res.D6 <- fry(xglm, index = genesymbollist, des, contrast = my.contrasts[,"D6"], sort = "directional")
+fry.res.D6[fry.res.D6$FDR < 0.3,] %>% filter(Direction == "Up")
+
+```
+
+## write gene set results to file
+```{r}
+# camera
+write.table(camera.res.D3, file = file.path(results.dir, "32_58_D3_NEG_camera_res.csv"), sep = ",")
+write.table(camera.res.D4, file = file.path(results.dir, "32_58_D4_NEG_camera_res.csv"), sep = ",")
+write.table(camera.res.D5, file = file.path(results.dir, "32_58_D5_NEG_camera_res.csv"), sep = ",")
+write.table(camera.res.D6, file = file.path(results.dir, "32_58_D6_NEG_camera_res.csv"), sep = ",")
+
+# roast
+write.table(roast.res.D3, file = file.path(results.dir, "32_58_D3_NEG_roast_res.csv"), sep = ",")
+write.table(roast.res.D4, file = file.path(results.dir, "32_58_D4_NEG_roast_res.csv"), sep = ",")
+write.table(roast.res.D5, file = file.path(results.dir, "32_58_D5_NEG_roast_res.csv"), sep = ",")
+write.table(roast.res.D6, file = file.path(results.dir, "32_58_D6_NEG_roast_res.csv"), sep = ",")
+
+# mroast
+write.table(mroast.res.D3, file = file.path(results.dir, "32_58_D3_NEG_mroast_res.csv"), sep = ",")
+write.table(mroast.res.D4, file = file.path(results.dir, "32_58_D4_NEG_mroast_res.csv"), sep = ",")
+write.table(mroast.res.D5, file = file.path(results.dir, "32_58_D5_NEG_mroast_res.csv"), sep = ",")
+write.table(mroast.res.D6, file = file.path(results.dir, "32_58_D6_NEG_mroast_res.csv"), sep = ",")
+
+# fry
+write.table(fry.res.D3, file = file.path(results.dir, "32_58_D3_NEG_fry_res.csv"), sep = ",")
+write.table(fry.res.D4, file = file.path(results.dir, "32_58_D4_NEG_fry_res.csv"), sep = ",")
+write.table(fry.res.D5, file = file.path(results.dir, "32_58_D5_NEG_fry_res.csv"), sep = ",")
+write.table(fry.res.D6, file = file.path(results.dir, "32_58_D6_NEG_fry_res.csv"), sep = ",")
+
+```
+
+#------------------------------------------------
+# PLOTS
+#------------------------------------------------
+
+## get sigificant genes from camera roast mroast and fry analysis
+```{r}
+hits <- unique(
+  c(
+  rownames(camera.res.D3[camera.res.D3$FDR < 0.01,]),
+  rownames(camera.res.D4[camera.res.D4$FDR < 0.01,]),
+  rownames(camera.res.D5[camera.res.D5$FDR < 0.01,]),
+  rownames(camera.res.D6[camera.res.D6$FDR < 0.01,]),
+  
+  rownames(roast.res.D3[roast.res.D3$FDR < 0.01,]),
+  rownames(roast.res.D4[roast.res.D4$FDR < 0.01,]),
+  rownames(roast.res.D5[roast.res.D5$FDR < 0.01,]),
+  rownames(roast.res.D6[roast.res.D6$FDR < 0.01,]),
+  
+  rownames(mroast.res.D3[mroast.res.D3$FDR < 0.01,]),
+  rownames(mroast.res.D4[mroast.res.D4$FDR < 0.01,]),
+  rownames(mroast.res.D5[mroast.res.D5$FDR < 0.01,]),
+  rownames(mroast.res.D6[mroast.res.D6$FDR < 0.01,]),
+  
+  rownames(fry.res.D3[fry.res.D3$FDR < 0.01,]),
+  rownames(fry.res.D4[fry.res.D4$FDR < 0.01,]),
+  rownames(fry.res.D5[fry.res.D5$FDR < 0.01,]),
+  rownames(fry.res.D6[fry.res.D6$FDR < 0.01,])
+  )
+  )
+
+
+hits.D3 <- topTags(qlf.D3, n = Inf)[[1]] %>% rownames_to_column() %>% filter(Symbol %in% hits)
+hits.D3$timepoint <- "D3"
+hits.D4 <- topTags(qlf.D4, n = Inf)[[1]] %>% rownames_to_column() %>% filter(Symbol %in% hits)
+hits.D4$timepoint <- "D4"
+hits.D5 <- topTags(qlf.D5, n = Inf)[[1]] %>% rownames_to_column() %>% filter(Symbol %in% hits)
+hits.D5$timepoint <- "D5"
+hits.D6 <- topTags(qlf.D6, n = Inf)[[1]] %>% rownames_to_column() %>% filter(Symbol %in% hits)
+hits.D6$timepoint <- "D6"
+
+hits.all <- rbind(hits.D3, hits.D4, hits.D5, hits.D6)
+counts <- dge$counts
+cpm <- edgeR::cpm(dge, normalized.lib.sizes = T, log = F)
+rownames(cpm) <- dge$genes$Symbol
+
+write.table(hits.all, file = file.path(results.dir, "32_58_D3_NEG_hits_all_timepoints.csv"), sep = ",")
+```
+
+## plot normalised counts per timepoint per guide of significant genes
+```{r, eval = F}
+pdf(file.path(plots.dir, "32_58_NEG_norm_counts_per_guide_timepoint.pdf"))
+lapply(hits, function(x){
+  dat <- as.data.frame(cpm) %>% 
+    rownames_to_column() %>% 
+    filter(grepl(as.character(x), rowname)) %>% 
+    reshape2::melt() %>% 
+    filter(grepl("NEG", variable)) %>% 
+    mutate(timepoint = str_split(variable, "\\.", simplify = T)[,3])
+  
+    p <- ggplot(dat, aes(y = value, x = timepoint, color = rowname, group = 1)) + 
+    geom_point() +
+    geom_smooth(method = "loess") + 
+    scale_y_continuous(trans = "log10") +
+    facet_wrap(~rowname, scales = "free_y") + 
+    labs(x = "Timepoint", y = "Log10 Counts Per Million") +
+    theme_bw()
+  return(p)
+})
+dev.off()
+```
+
+## plot log2FC per timepoint per guide of significant genes
+```{r, eval = F}
+pdf(file.path(plots.dir, "32_58_NEG_logFC_per_guide_timepoint.pdf"))
+lapply(hits, function(x){
+  dat <- as.data.frame(hits.all) %>% 
+    filter(Symbol == as.character(x)) %>% 
+    mutate(gene = paste(Symbol, Guide, sep = '.')) %>% 
+    reshape2::melt()
+  
+    p <- ggplot(dat, aes(y = value, x = timepoint, color = rowname, group = 1)) + 
+    geom_point() +
+    geom_smooth(method = "loess") + 
+    facet_wrap(~ gene, scales = "free_y") + 
+    labs(x = "Timepoint", y = "Log2 FC vs corresponding timepoint LIB control") +
+    theme_bw()
+  return(p)
+})
+dev.off()
+```
+
+## plot pct abundance per timepoint per guide of significant genes
+```{r, eval = F}
+pdf(file.path(plots.dir, "32_58_NEG_pct_per_guide_timepoint.pdf"))
+lapply(hits, function(x){
+  dat <- as.data.frame(sweep(as.data.frame(cpm), 2, colSums(as.data.frame(cpm)), `/`) * 100) %>%
+  rownames_to_column() %>% 
+  filter(grepl(as.character(x), rowname)) %>% 
+  reshape2::melt() %>% 
+  filter(grepl("NEG", variable)) %>% 
+  mutate(timepoint = str_split(variable, "\\.", simplify = T)[,3])
+  
+    p <- ggplot(dat, aes(y = value, x = timepoint, color = rowname, group = 1)) + 
+    geom_point() +
+    geom_smooth(method = "loess") + 
+    facet_wrap(~rowname, scales = "free_y") + 
+    labs(x = "Timepoint", y = "Percentage abundance") +
+    theme_bw()
+  return(p)
+})
+dev.off()
+
+```
+
+## Barcode plots
+```{r}
+barcodeplot(qlf.D3$table$logFC, index = genesymbollist$MED30, main = "Barcodeplot for MED30",
+labels = c("Negative logFC", "Positive logFC"), quantile = c(-0.5, 0.5))
+barcodeplot(qlf.D4$table$logFC, index = genesymbollist$MED30, main = "Barcodeplot for MED30",
+labels = c("Negative logFC", "Positive logFC"), quantile = c(-0.5, 0.5))
+barcodeplot(qlf.D5$table$logFC, index = genesymbollist$MED30, main = "Barcodeplot for MED30",
+labels = c("Negative logFC", "Positive logFC"), quantile = c(-0.5, 0.5))
+barcodeplot(qlf.D6$table$logFC, index = genesymbollist$MED30, main = "Barcodeplot for MED30",
+labels = c("Negative logFC", "Positive logFC"), quantile = c(-0.5, 0.5))
+```
+
+## CPM X logFC PLOTS
+```{r}
+NEG.hits <- unique(hits.all$Symbol)
+NEG.avgLogFC <- top4$table %>% select(Symbol, logFC, logCPM) %>% filter(Symbol %in% NEG.hits) %>% group_by(Symbol) %>% summarise(avgLogFC = mean(logFC))
+NEG.avgLogCPM <- top4$table %>% select(Symbol, logFC, logCPM) %>% filter(Symbol %in% NEG.hits) %>% group_by(Symbol) %>% summarise(avgLogCPM = mean(logCPM))
+
+dat <- camera.res.D3 %>% rownames_to_column(var = "Symbol") %>% filter(FDR < 0.1) 
+dat <- left_join(dat, NEG.avgLogFC, by = "Symbol")
+dat <- left_join(dat, NEG.avgLogCPM, by = "Symbol")
+
+med.dat <- dat %>% filter(Symbol %in% c("MED15", "MED12"))
+pol.dat <- dat[grep("POL", dat$Symbol),]
+
+ggplot(dat, aes(x = avgLogFC, y = -log10(FDR)), alpha = 0.5) + 
+  geom_point() +
+  geom_point(data = med.dat, aes(x = avgLogFC, y = -log10(FDR), color = "red")) +
+  scale_y_continuous(trans = "log10") + theme_bw() + 
+  ggrepel::geom_text_repel(data = med.dat, aes(x = avgLogFC, y = -log10(FDR)),
+    label=med.dat$Symbol) + xlim(c(0,3.5))
+
+```
+
+## Dotplots across timepoints
+```{r}
+# clone58.R2.D3.gene.mid$Timepoint = "58.R2.D3.MID"
+# clone58.R2.D4.gene.mid$Timepoint = "58.R2.D4.MID"
+# clone58.R2.D5.gene.mid$Timepoint = "58.R2.D5.MID"
+# clone58.R2.D6.gene.mid$Timepoint = "58.R2.D6.MID"
+
+# NEG samples
+all.samps <- rbind(hits.D3, hits.D4, hits.D5, hits.D6)
+
+all.samps <- as_tibble(all.samps)
+all.samps.genes <- all.samps %>% filter(FDR < 0.05) %>% filter(logFC > 1) 
+all.samps <- all.samps[which(all.samps$Symbol %in% all.samps.genes$Symbol),]
+all.samps$Timepoint <- as.factor(all.samps$timepoint)
+all.samps$Symbol <- as.factor(all.samps$Symbol)
+
+# filter out max logFC value sgRNA per gene
+all.samps.maxFC <- all.samps %>% group_by(Symbol, Timepoint) %>% filter(logFC == max(logFC))
+
+# # MID samples
+# all.samps.mid <- rbind(clone58.R2.D3.gene.mid, clone58.R2.D4.gene.mid, clone58.R2.D5.gene.mid, clone58.R2.D6.gene.mid)
+# all.samps.mid <- as_tibble(all.samps.mid)
+# all.samps.mid.genes <- all.samps.mid %>% filter(FDR < 0.05) %>% filter(Score > 1) 
+# all.samps.mid <- all.samps.mid[which(all.samps.mid$id %in% all.samps.mid.genes$id),]
+# all.samps.mid$Timepoint <- as.factor(all.samps.mid$Timepoint)
+# all.samps.mid$id <- as.factor(all.samps.mid$id)
+
+# setup color palette
+myPalette <- colorRampPalette(brewer.pal(9, "Reds"))
+
+# create plot
+ggplot(all.samps.maxFC, aes(x = Timepoint, y = Symbol, size = -log10(FDR), col = logFC)) + 
+  geom_point(stat = "identity", alpha = 0.8, shape = 16) +
+  theme_bw() +
+  scale_size_continuous(range = c(0.001, 6)) +
+  labs(y = "Symbol", x = "Timepoint", title = "Clone 58 NEG screen hits") +
+  theme(axis.text.x=element_text(angle = 0, size = 9), axis.text.y=element_text(size = 9)) + 
+  scale_colour_gradientn(colours = myPalette(100), limits=c(1, 4), na.value = "grey90")
+ggsave(file.path(plots.dir, "NEG_significant_genes_dotplot.pdf"), width = 5, height = 9)
+
+# ggplot(all.samps.mid, aes(x = Timepoint, y = id, size = LogFDR, col = Score)) + 
+#   geom_point(stat = "identity", alpha = 0.8, shape = 16) +
+#   theme_bw() +
+#   #scale_size_continuous(range = c(0.01, 8)) +
+#   labs(y = "Gene", x = "Timepoint", title = "Clone 58 MID screen hits") +
+#   theme(axis.text.x=element_text(angle = 0, size = 9), axis.text.y=element_text(size = 9)) +
+#   scale_colour_gradientn(colours = myPalette(100), limits=c(1, 3), na.value = "grey90")
+# ggsave("K562_Chromatin/58_chromatin/MID_significant_genes_dotplot.pdf", width = 4, height = 8)
+
+```
+
+## Mediator specific dotplots
+```{r}
+med.samps <- all.samps.maxFC[grep("^MED|CDK8|CCNC",all.samps.maxFC$Symbol, value = F),]
+med.samps$Timepoint <- as.factor(med.samps$Timepoint)
+med.samps$Symbol <- factor(med.samps$Symbol, levels = rev(c("MED14","MED6","MED8","MED11","MED17","MED18","MED20","MED1","MED4","MED9","MED19","MED21","MED31","MED15","MED27","MED29","MED30","MED16","MED23","MED24","MED25","CDK8","MED12","MED13")))
+
+
+ggplot(med.samps, aes(x = Timepoint, y = Symbol, size = -log10(FDR), col = logFC)) + 
+  geom_point(stat = "identity", alpha = 0.8, shape = 16) +
+  theme_bw() +
+  scale_size_continuous(range = c(0.01, 6)) +
+  labs(y = "Gene", x = "Timepoint", title = "Clone 58 NEG Mediator hits") +
+  theme(axis.text.x=element_text(angle = 0, size = 9), axis.text.y=element_text(size = 9)) + 
+  scale_colour_gradientn(colours = myPalette(100), limits=c(1, 4), na.value = "grey90")
+ggsave(file.path(plots.dir, "NEG_Mediator_genes_dotplot.pdf"), width = 4, height = 6)
+```
+
+## Pol II specific dotplots
+```{r}
+pol.samps <- all.samps.maxFC[grep("^POLR",all.samps.maxFC$Symbol, value = F),]
+pol.samps$Timepoint <- as.factor(pol.samps$Timepoint)
+pol.samps$Symbol <- factor(pol.samps$Symbol, 
+                           levels = rev(c("POLR2A","POLR2B","POLR2C","POLR2D","POLR2E","POLR2F","POLR2G","POLR2H","POLR2L","POLR2K")))
+
+ggplot(pol.samps, aes(x = Timepoint, y = Symbol, size = -log10(FDR), col = logFC)) + 
+  geom_point(stat = "identity", alpha = 0.8, shape = 16) +
+  theme_bw() +
+  scale_size_continuous(range = c(0.01, 6)) +
+  labs(y = "Gene", x = "Timepoint", title = "Clone 58 NEG Pol2 hits") +
+  theme(axis.text.x=element_text(angle = 0, size = 9), axis.text.y=element_text(size = 9)) + 
+  scale_colour_gradientn(colours = myPalette(100), limits=c(1, 4), na.value = "grey90")
+ggsave(file.path(plots.dir, "NEG_Pol_genes_dotplot.pdf"), width = 4, height = 4)
+
+```
+
+
+## plot factor enrichment over time
+```{r}
+hits.dat <- all.samps.maxFC[which(all.samps.maxFC$Symbol %in% hits),]
+hits.dat$Timepoint <- as.factor(hits.dat$Timepoint)
+#hits.dat <- arrange(hits.dat, desc(logFC)) %>% filter(FDR < 0.1)
+
+# define gene groups
+hits.dat$Group <- "Other"
+hits.dat$Group[grep("^MED|CDK8|CCNC",hits.dat$Symbol, value = F)] <- "Mediator"
+hits.dat$Group[grep("^POLR",hits.dat$Symbol, value = F)] <- "Pol II"
+hits.dat$Group[grep("EP300|BRD|SUPT|TAF|WDR|INTS|GTF",hits.dat$Symbol, value = F)] <- "Cofactor"
+
+# smooth and line
+hits.dat %>% ungroup() %>%
+  dplyr::select(Symbol, logFC, Timepoint, Group) %>%
+  reshape2::melt() %>% mutate(Group = factor(Group, levels = c("Pol II", "Mediator", "Cofactor", "Other"))) %>%
+  ggplot(aes(x = Timepoint, y = value, group = Group, color = Group)) +
+    geom_smooth() +
+    geom_line(aes(x = Timepoint, y = value, group = Symbol), alpha = 0.2) +
+    labs(x = "Timepoint", y = "logFC", title = "logFC by Timepoint") +
+    theme_bw() + theme(legend.position = "none") +
+    facet_wrap(~Group, nrow = 1)
+ggsave("./edgeR/plots/group_enrichment_vs_time_smoothline.pdf", width = 6, height = 3)
+
+# smooth only
+hits.dat %>% ungroup() %>%
+  dplyr::select(Symbol, logFC, Timepoint, Group) %>%
+  reshape2::melt() %>% mutate(Group = factor(Group, levels = c("Pol II", "Mediator", "Cofactor", "Other"))) %>%
+  ggplot(aes(x = Timepoint, y = value, group = Group, color = Group)) +
+    geom_smooth() +
+    labs(x = "Timepoint", y = "logFC", title = "logFC by Timepoint") +
+    theme_bw() + theme(legend.position = "none") +
+    facet_wrap(~Group, nrow = 1)
+ggsave("./edgeR/plots/group_enrichment_vs_time_smooth.pdf", width = 6, height = 3)
+
+
+# as boxplot
+hits.dat %>% ungroup() %>%
+  dplyr::select(Symbol, logFC, Timepoint, Group) %>%
+  melt() %>%
+  ggplot(aes(x = Timepoint, y = value, color = Timepoint)) +
+    geom_boxplot() +
+    labs(x = "Timepoint", y = "logFC", title = "logFC by Timepoint") +
+    theme_bw() + theme(legend.position = "none") +facet_wrap(~Group, nrow = 1)
+ggsave("./edgeR/plots/group_enrichment_vs_time_box.pdf", width = 6, height = 3)
+
+```
+
+## SAGA specific dotplots - only SUPT20H and TAF10 hit
+```{r}
+# saga.genes <- c("SF3B3", "SF3B5", "TRAAP", "KAT2A", "KAT2B","SGF29", "TADA2B", "TADA3", "TBP", "SUPT3H", "SUPT7L", "SUPT20H", "TADA1", "TAF5L", "TAF6L",
+#                 "TAF9B","TAF10", "TAF12", "ATXN7", "ATXN7L3", "ENY2", "USP22")
+# saga.samps <- all.samps.maxFC %>% filter(Symbol %in% saga.genes)
+# saga.samps$Timepoint <- as.factor(saga.samps$Timepoint)
+# saga.samps$Symbol <- factor(saga.samps$Symbol, 
+#                            levels = rev(c()))
+# 
+# ggplot(pol.samps, aes(x = Timepoint, y = Symbol, size = -log10(FDR), col = logFC)) + 
+#   geom_point(stat = "identity", alpha = 0.8, shape = 16) +
+#   theme_bw() +
+#   #scale_size_continuous(range = c(0.01, 8)) +
+#   labs(y = "Gene", x = "Timepoint", title = "Clone 58 NEG screen hits") +
+#   theme(axis.text.x=element_text(angle = 0, size = 9), axis.text.y=element_text(size = 9)) + 
+#   scale_colour_gradientn(colours = myPalette(100), limits=c(1, 4), na.value = "grey90")
+# ggsave("K562_Chromatin/58_chromatin/NEG_significant_genes_dotplot.pdf", width = 4, height = 8)
+
+```
+
+## Dotplots per day - needs fixing
+```{r}
+dat <- as.tibble(all.samps.maxFC)
+dat$LogFDR <- -log10(dat$FDR)
+dat$RandomIndex <- sample(1:nrow(dat), nrow(dat))
+alphabetical <- dat[order(dat$Symbol),]
+dat$alphabetical <- seq(1,nrow(dat))
+dat <- dat[order(-dat$logFC), ]
+pos <- dat[dat$logFC>0, ]
+pos <- pos %>% mutate(color = if_else(pos$LogFDR>1.3,true = "Sig", false = "NotSig"))
+neg <- dat[dat$logFC<0, ]
+dat <- dat %>% mutate(color = if_else(dat$LogFDR>1.3,true = "Sig", false = "NotSig"))
+dat$label <- dat$Symbol
+dat$label <- if_else(dat$LogFDR>1.3, dat$label, "")
+ixlabel <- which(dat$LogFDR>1.3)
+dat$label[ixlabel] <- dat$Symbol[ixlabel] 
+ggplot(dat) + 
+  geom_point(aes(x = alphabetical, y = LogFDR, col = color, label = Symbol)) + 
+  theme_bw() + 
+  scale_y_continuous(trans = "log1p") + 
+  ylim(c(0,4)) +
+  geom_hline(yintercept = 1.3, color = "grey40") +
+  scale_size_continuous(range = c(-6, 6)) +
+  scale_colour_manual(values = c("grey", "firebrick")) +
+  facet_wrap(~ Timepoint, scales = "free_x")
+
+ggplot(pos) + 
+  geom_point(aes(x = RandomIndex, y = LogFDR, col = color, label = id)) + 
+  theme_bw() + 
+  scale_y_continuous(trans = "log1p") + 
+  ylim(c(0,4)) +
+  geom_hline(yintercept = 1.3, color = "grey40") +
+  scale_size_continuous(range = c(-6, 6)) +
+  scale_colour_manual(values = c("grey", "firebrick"))
+
+
+  
+ScatterView(dat, x = "RandomIndex", y = "Score", label = "id", size = "LogFDR", 
+                 y_cut = 1.3, groups = "top", toplabels = pos$id[1:10], force = 2, , display_cut = T) + ylim(c(0,4)) 
+p
+```
+
+#----------- Paper figures
+## import hgnc gene complex annotations and replot
+```{r}
+hgnc.anno <- read.csv("./hgnc-symbol-check.csv")
+hgnc.anno <- as.tibble(hgnc.anno)
+
+hits.dat <- all.samps.maxFC[which(all.samps.maxFC$Symbol %in% hits),]
+hits.dat$Timepoint <- as.factor(hits.dat$Timepoint)
+#hits.dat <- arrange(hits.dat, desc(logFC)) %>% filter(FDR < 0.1)
+
+# match gene groups
+which(hgnc.anno$Approved.symbol %in% hits.dat$Symbol)
+group.info <- lapply(hits.dat$Symbol, function(x){
+  group <- hgnc.anno[which(hgnc.anno$Input == x, arr.ind = TRUE),]
+  group <- group[1,7]
+  return(group)
+})
+
+hits.dat$Group <- unlist(group.info)
+table(hits.dat$Group)
+
+# smooth and line
+hits.dat %>% ungroup() %>%
+  dplyr::select(Symbol, logFC, Timepoint, Group) %>%
+  reshape2::melt() %>% mutate(Group = factor(Group, levels = c("RNA Pol II", "Mediator", "Core transcription", "Transcriptional initiation pausing elongation", "Chromatin modifying", "TF", "Structural", "Other"))) %>% filter(Group != "Other" & Group != "Structural") %>%
+  ggplot(aes(x = Timepoint, y = value, group = Group, color = Group)) +
+    geom_smooth() +
+    geom_line(aes(x = Timepoint, y = value, group = Symbol), alpha = 0.2) +
+    labs(x = "Timepoint", y = "logFC", title = "logFC by Timepoint") +
+    theme_bw() + theme(legend.position = "none") +
+    facet_wrap(~Group, nrow = 1)
+ggsave("./edgeR/plots/group_enrichment_vs_time_smoothline_regroup.pdf", width = 6, height = 3)
+
+# smooth only
+hits.dat %>% ungroup() %>%
+  dplyr::select(Symbol, logFC, Timepoint, Group) %>%
+  reshape2::melt() %>% mutate(Group = factor(Group, levels = c("RNA Pol II", "Core transcription", "Mediator", "Chromatin modifying", "Transcriptional initiation pausing elongation", "TF", "Structural", "Other"))) %>%
+  ggplot(aes(x = Timepoint, y = value, group = Group, color = Group)) +
+    geom_smooth() +
+    labs(x = "Timepoint", y = "logFC", title = "logFC by Timepoint") +
+    theme_bw() + theme(legend.position = "none") +
+    facet_wrap(~Group, nrow = 1)
+ggsave("./edgeR/plots/group_enrichment_vs_time_smooth_regroup.pdf", width = 6, height = 3)
+
+
+# as boxplot
+hits.dat %>% ungroup() %>%
+  dplyr::select(Symbol, logFC, Timepoint, Group) %>%
+  melt() %>%
+  ggplot(aes(x = Timepoint, y = value, color = Timepoint)) +
+    geom_boxplot() +
+    labs(x = "Timepoint", y = "logFC", title = "logFC by Timepoint") +
+    theme_bw() + theme(legend.position = "none") +facet_wrap(~Group, nrow = 1)
+ggsave("./edgeR/plots/group_enrichment_vs_time_box_regroup.pdf", width = 6, height = 3)
+
+
+```
+
+## Dotplots across timepoints - alternate
+```{r}
+
+# NEG samples
+all.dat <- rbind(hits.D3, hits.D4, hits.D5, hits.D6)
+all.samps <- all.dat %>% filter(FDR < 0.05 | logFC > 1) # 
+#all.samps <- all.samps %>% filter(Symbol %in% hits) 
+all.samps <- all.samps %>% filter(Symbol != "safe") %>% filter(Symbol != "none")
+genes.to.plot <- unique(all.samps$Symbol)
+
+all.samps <- all.dat %>% filter(Symbol %in% genes.to.plot)
+all.samps$Timepoint <- as.factor(all.samps$timepoint)
+all.samps$Symbol <- as.factor(all.samps$Symbol)
+
+group.info <- lapply(all.samps$Symbol, function(x){
+  group <- hgnc.anno[which(hgnc.anno$Input == x, arr.ind = TRUE),]
+  group <- group[1,7]
+  return(group)
+})
+
+all.samps$Group <- unlist(group.info)
+table(all.samps$Group)
+
+# filter out max logFC value sgRNA per gene per timepoint
+all.samps.maxFC <- all.samps %>% 
+  group_by(Symbol, Timepoint) %>% 
+  filter(logFC == max(logFC)) %>%
+  mutate(Group = factor(Group, levels = c("RNA Pol II", "Core transcription", "Mediator", "Chromatin modifying", "Transcriptional initiation pausing elongation", "TF", "Structural", "Other"))) %>% filter(Group != "Other" & Group != "Structural") 
+
+# reset gene groups to plot based on gene family
+all.samps.maxFC <- all.samps.maxFC[order(all.samps.maxFC$Group),]
+all.samps.maxFC$Symbol <- factor(all.samps.maxFC$Symbol, levels = rev(unique(all.samps.maxFC$Symbol)))
+
+# setup color palette
+myPalette <- colorRampPalette(brewer.pal(100, "Reds"))
+
+# create plot
+library(forcats)
+
+p <- ggplot(all.samps.maxFC, aes(x = Timepoint, y = Symbol, size = -log10(FDR), col = logFC)) + 
+  geom_point(stat = "identity", alpha = 0.8, shape = 16) +
+  theme_bw() +
+  scale_size_continuous(range = c(0.001, 6)) +
+  labs(y = "Symbol", x = "Timepoint", title = "Clone 58 NEG screen hits") +
+  theme(axis.text.x=element_text(angle = 0, size = 9), axis.text.y=element_text(size = 9)) +
+  theme_classic() +
+  scale_colour_gradientn(colours = myPalette(100), limits=c(1, 4), na.value = "grey80")
+ggsave(file.path(plots.dir, "NEG_significant_genes_dotplot.pdf"), width = 5, height = 9)
+
+library(cowplot)
+
+# Create the annotation bar (side bar)
+annotation <- ggplot(all.samps.maxFC, aes(x = 1, y = Symbol, fill = Group)) +
+  geom_tile() +
+  theme_void() + 
+  theme(legend.position = "none")
+
+# Combine the dot plot and annotation bar
+combined_plot <- p + annotation + plot_layout(ncol = 2, widths = c(4, 1))
+
+combined_plot
+
+# ggplot(all.samps.mid, aes(x = Timepoint, y = id, size = LogFDR, col = Score)) + 
+#   geom_point(stat = "identity", alpha = 0.8, shape = 16) +
+#   theme_bw() +
+#   #scale_size_continuous(range = c(0.01, 8)) +
+#   labs(y = "Gene", x = "Timepoint", title = "Clone 58 MID screen hits") +
+#   theme(axis.text.x=element_text(angle = 0, size = 9), axis.text.y=element_text(size = 9)) +
+#   scale_colour_gradientn(colours = myPalette(100), limits=c(1, 3), na.value = "grey90")
+# ggsave("K562_Chromatin/58_chromatin/MID_significant_genes_dotplot.pdf", width = 4, height = 8)
+
+```
+
+#-----------
+
+#------------------------------------------------
+# GSEA / GO analysis
+#------------------------------------------------
+
+## setup enrichR
+```{r}
+library(enrichR)
+
+websiteLive <- getOption("enrichR.live")
+if (websiteLive) {
+    listEnrichrSites()
+    setEnrichrSite("Enrichr") # Human genes   
+}
+
+dbs <- listEnrichrDbs()
+enriched <- enrichr(c("Runx1", "Gfi1", "Gfi1b", "Spi1", "Gata1", "Kdr"), dbs)
+
+dbs <- c("GO_Molecular_Function_2015", "GO_Cellular_Component_2015", "GO_Biological_Process_2015")
+
+
+plotEnrich(enriched[[3]], showTerms = 20, numChar = 40, y = "Count", orderBy = "P.value")
+
+all.samps.maxFC
+
+geneList <- clone58.R2.D6.gene$FDR
+names(geneList) <- clone58.R2.D6.gene$id
+enrich <- EnrichAnalyzer(geneList = geneList[geneList<0.05], 
+                        method = "HGT", type = "GOCC", filter = F)
+EnrichedView(enrich, mode = 1, top = 20)
+
+#enrichPro = EnrichAnalyzer(geneList[geneList>1], type = "CORUM+CPX", filter = T)
+#EnrichedView(enrichPro, top = 30)
+```
+
+#------------------------------------------------
+# MID sample analysis - Combined clones
+#------------------------------------------------
+

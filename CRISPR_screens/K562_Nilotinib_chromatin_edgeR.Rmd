@@ -1,0 +1,741 @@
+---
+title: "K562 MYC-mNG Clone 58 Drug Screen = Chromatin library - Nilotinib"
+output: html_document
+---
+
+#--------------------------------------------
+# K562 MYC-mNG Clone 58 Drug Screen = Chromatin library - Nilotinib
+#--------------------------------------------
+K562 MYC-mNeonGreen cells were transduced with the human chromatin focussed sgRNA library. 
+Cells were then treated with 500nM Nilotinib (ABL1 inhibitor)
+GFP positive cells that maintained MYC expression in the presence of Nilotinib were enriched by FACS at 24h and 48h post drug addition and sequenced --> SORT fraction (positive selection arm)
+Timepoint matched LIB control fractions were taken at each timepoint. 
+Two replicates were performed, one each for both clone 3 and clone 5. 
+
+BARtab v1.4 was used to extract and count sgRNAs from raw sequencing reads
+Resulting counts tables are imported here for CRISPR screen analysis using edgeR.
+
+# Setup
+
+## import libraries
+```{r, message=FALSE, warning=FALSE}
+library(edgeR)
+library(bartools)
+library(tidyverse)
+library(ggpointdensity)
+library(viridis)
+#library(MAGeCKFlute)
+library(RColorBrewer)
+library(ggvenn)
+library(enrichR)
+```
+
+## setup output dirs
+```{r, message=FALSE, warning=FALSE}
+dir.create("edgeR", showWarnings = F)
+
+results.dir <- file.path(getwd(), "edgeR/results")
+dir.create(results.dir, showWarnings = F)
+
+plots.dir <- file.path(getwd(), "edgeR/plots")
+dir.create(plots.dir, showWarnings = F)
+```
+
+#------------------------------------------------
+# Setup DGEList object
+#------------------------------------------------
+
+## import counts files
+```{r}
+raw.counts <- read.delim("./K562_Nilotinib_chromatin_raw_counts.txt", header = T, sep = "\t", row.names = 1)
+raw.counts <- raw.counts[,grep("NIL", colnames(raw.counts))]
+colnames(raw.counts) <- c( "CHROM.48h.NIL.SORT.R2", "CHROM.24h.NIL.LIB.R1", "CHROM.48h.NIL.SORT.R3", "CHROM.48h.NIL.SORT.R1", 
+                           "CHROM.24h.NIL.SORT.R3", "CHROM.48h.NIL.LIB.R3", "CHROM.24h.NIL.LIB.R3", "CHROM.48h.NIL.LIB.R1", 
+                           "CHROM.24h.NIL.SORT.R2", "CHROM.48h.NIL.LIB.R2", "CHROM.24h.NIL.LIB.R2", "CHROM.24h.NIL.SORT.R1")
+```
+
+## generate metadata
+```{r}
+metadata <- as.data.frame(str_split(colnames(raw.counts), pattern = "\\.", simplify = T), row.names = colnames(raw.counts))
+colnames(metadata) <- c("Library", "Timepoint", "Treatment", "Group", "Replicate")
+metadata$Contrasts <- paste(metadata$Group, metadata$Timepoint, sep = ".")
+
+# fix gene names
+genes <- as.data.frame(str_split(rownames(raw.counts), "_", simplify = T))
+sgRNAs <- as.data.frame(str_split(genes[,3], "\\.", simplify = T))
+genes$V4 <- sgRNAs$V2
+genes$V3 <- sgRNAs$V1
+colnames(genes) <- c("Symbol", "ENSEMBL", "ENTREZ", "Guide")
+```
+
+## setup DGEList
+```{r}
+dge <- DGEList(counts = as.matrix(raw.counts), samples = metadata, group = metadata$Group, genes = genes, remove.zeros = T)
+dim(dge)
+```
+
+## Filter sgRNAs
+```{r}
+table(dge$samples$group)
+# Filter sgRNAs and samples with low counts Need a CPM greater than 5 in 15 or more samples
+# to keep sgRNAs
+selr = rowSums(dge$counts) > 10
+table(selr)
+# Need at least 100,000 reads to keep a given sample
+selc = colSums(dge$counts) >= 1e+05
+table(selc)
+dge = dge[selr, selc]
+dim(dge)
+saveRDS(dge, file.path(results.dir, "./CHROM_NIL_DGE.rds"))
+```
+
+## Plot counts per sample & guide
+```{r}
+# Set up drug treatment colours
+cols = as.numeric(dge$samples$group) + 1
+# Plot number of sgRNAs that could be matched per sample and total for each sgRNA across
+# all samples
+
+barplot(colSums(dge$counts), las = 2, main = "Counts per index", col = cols, cex.names = 0.5,
+cex.axis = 0.8)
+barplot(rowSums(dge$counts), las = 2, main = "Counts per sgRNA", cex.names = 0.5, cex.axis = 0.8)
+
+pdf(file.path(plots.dir,"./CHROM_NIL_counts_per_index.pdf"), useDingbats = F)
+barplot(colSums(dge$counts), las = 2, main = "Counts per index", col = cols, cex.names = 0.5, cex.axis = 0.8)
+barplot(rowSums(dge$counts), las = 2, main = "Counts per sgRNA", cex.names = 0.5, cex.axis = 0.8)
+dev.off()
+```
+#------------------------------------------------
+# Differential abundance analysis: SORT vs LIB
+#------------------------------------------------
+
+```{r}
+dge = calcNormFactors(dge, method = "TMM")
+
+# Make an MDS plot to visualise relationships between replicate samples Set up infection #
+# colours
+cols2 = as.numeric(factor(dge$samples$group)) + 1
+plotMDS(removeBatchEffect(dge, dge$samples$Replicate), col = cols, main = "MDS Plot - limma::removeBatchEffect")
+plotMDS(dge, col = cols2, main = "MDS Plot - no batch correction")
+
+pdf(file.path(plots.dir, "CHROM_NIL_MDS.pdf"), useDingbats = F)
+plotMDS(removeBatchEffect(dge, dge$samples$Replicate), col = cols, main = "MDS Plot - limma::removeBatchEffect")
+plotMDS(dge, col = cols2, main = "MDS Plot - no batch correction")
+dev.off()
+```
+## Set up design matrix for GLM
+```{r}
+# Set up design matrix for GLM
+group = as.factor(dge$samples$group)
+replicate = as.factor(dge$samples$Replicate)
+timepoint = as.factor(dge$samples$Timepoint)
+contrasts = as.factor(dge$samples$Contrasts)
+
+des = model.matrix(~0 + contrasts)
+#colnames(des) <- levels(sample)
+colnames(des) <- c("LIB.24h", "LIB.48h", "SORT.24h", "SORT.48h")
+des
+
+```
+
+## Estimate dispersions
+```{r}
+xglm = estimateDisp(dge, des, tagwise = T)
+sqrt(xglm$common.disp)
+```
+
+## Plot BCVs versus abundance
+```{r}
+plotBCV(xglm, main = "BCV Plot")
+
+# save BCV plot
+pdf(file.path(plots.dir,"CHROM_NIL_BCV.pdf"), useDingbats = F)
+plotBCV(xglm, main = "BCV Plot")
+dev.off()
+```
+
+## Fit negative bionomial GLM
+```{r}
+fit = glmFit(xglm, des)
+fit.qlf = glmQLFit(xglm, des)
+
+# define contrasts of interest
+# separate timepoints
+my.contrasts <- makeContrasts(
+  SORT.D1 = SORT.24h-LIB.24h,
+  SORT.D2 = SORT.48h-LIB.48h,
+  levels = des)
+
+# Carry out LRT test
+lrt.D1 = glmLRT(fit, contrast = my.contrasts[,"SORT.D1"])
+lrt.D2 = glmLRT(fit, contrast = my.contrasts[,"SORT.D2"])
+
+write.csv(topTags(lrt.D1, n = Inf), file = file.path(results.dir, "CHROM_NIL_D1_LRT_toptags.csv"))
+write.csv(topTags(lrt.D2, n = Inf), file = file.path(results.dir, "CHROM_NIL_D2_LRT_toptags.csv"))
+
+# Carry out QLF test
+qlf.D1 = glmQLFTest(fit.qlf, contrast = my.contrasts[,"SORT.D1"])
+qlf.D2 = glmQLFTest(fit.qlf, contrast = my.contrasts[,"SORT.D2"])
+
+write.csv(topTags(qlf.D1, n = Inf), file = file.path(results.dir, "CHROM_NIL_D1_qlf_toptags.csv"))
+write.csv(topTags(qlf.D2, n = Inf), file = file.path(results.dir, "CHROM_NIL_D2_qlf_toptags.csv"))
+```
+
+## Plot smear for LO samples
+```{r}
+# SORT fraction D1
+thresh = 0.1
+lfc = 1
+top4 = topTags(qlf.D1, n = Inf)
+top4ids = rownames(top4$table[top4$table$FDR < thresh & abs(top4$table$logFC) >= lfc,])
+
+plotSmear(qlf.D1, de.tags = top4ids, pch = 20, cex = 0.6, main = "NIL 24h CHROM SORT: logFC vs logCPM")
+abline(h = c(-1, 0, 1), col = c("dodgerblue", "yellow", "dodgerblue"), lty = 2)
+
+pdf(file.path(plots.dir,"CHROM_NIL_smear_D1.pdf"), useDingbats = F)
+plotSmear(qlf.D1, de.tags = top4ids, pch = 20, cex = 0.6, main = "NIL 24h CHROM SORT: logFC vs logCPM")
+abline(h = c(-1, 0, 1), col = c("dodgerblue", "yellow", "dodgerblue"), lty = 2)
+dev.off()
+
+# SORT fraction D2
+thresh = 0.1
+lfc = 1
+top4 = topTags(qlf.D2, n = Inf)
+top4ids = rownames(top4$table[top4$table$FDR < thresh & abs(top4$table$logFC) >= lfc,])
+
+plotSmear(qlf.D2, de.tags = top4ids, pch = 20, cex = 0.6, main = "NIL 48h CHROM SORT: logFC vs logCPM")
+abline(h = c(-1, 0, 1), col = c("dodgerblue", "yellow", "dodgerblue"), lty = 2)
+
+pdf(file.path(plots.dir,"CHROM_NIL_smear_D2.pdf"), useDingbats = F)
+plotSmear(qlf.D2, de.tags = top4ids, pch = 20, cex = 0.6, main = "NIL 48h CHROM SORT: logFC vs logCPM")
+abline(h = c(-1, 0, 1), col = c("dodgerblue", "yellow", "dodgerblue"), lty = 2)
+dev.off()
+```
+
+
+#------------------------------------------------
+# Gene set testing:
+#------------------------------------------------
+
+## setup gene list for camera
+```{r}
+genesymbols = dge$genes[,1]
+genesymbollist = list()
+unq = unique(genesymbols)
+unq = unq[!is.na(unq)]
+for (i in unq) {
+  sel = genesymbols == i & !is.na(genesymbols)
+  if (sum(sel) > 3){
+    genesymbollist[[i]] = which(sel)
+  }
+}
+
+write(unq, file = file.path(results.dir, "CHROM_lib_genes.txt"))
+```
+
+## Run camera for all genes
+```{r}
+camera.res.D1 = camera(xglm, index = genesymbollist, des, contrast = my.contrasts[,"SORT.D1"])
+camera.res.D1 %>% filter(Direction == "Up") %>% arrange(FDR)
+camera.res.D1[camera.res.D1$FDR < 0.1,]
+
+camera.res.D2 = camera(xglm, index = genesymbollist, des, contrast = my.contrasts[,"SORT.D2"])
+camera.res.D2 %>% filter(Direction == "Up") %>% arrange(FDR)
+camera.res.D2[camera.res.D2$FDR < 0.1,]
+
+```
+
+## Run roast for all genes
+```{r}
+roast.res.D1 = roast(xglm, index = genesymbollist, des, contrast = my.contrasts[,"SORT.D1"])
+roast.res.D1 %>% filter(Direction == "Up") %>% arrange(FDR)
+roast.res.D1[roast.res.D1$FDR < 0.1,]
+
+roast.res.D2 = roast(xglm, index = genesymbollist, des, contrast = my.contrasts[,"SORT.D2"])
+roast.res.D2 %>% filter(Direction == "Up") %>% arrange(FDR)
+roast.res.D2[roast.res.D2$FDR < 0.1,]
+
+```
+
+## Run mroast for all genes
+```{r}
+mroast.res.D1 = mroast(xglm, index = genesymbollist, des, contrast = my.contrasts[,"SORT.D1"])
+mroast.res.D1 %>% filter(Direction == "Up") %>% arrange(FDR)
+mroast.res.D1[mroast.res.D1$FDR < 0.1,]
+
+mroast.res.D2 = mroast(xglm, index = genesymbollist, des, contrast = my.contrasts[,"SORT.D2"])
+mroast.res.D2 %>% filter(Direction == "Up") %>% arrange(FDR)
+mroast.res.D2[mroast.res.D2$FDR < 0.1,]
+
+```
+
+## Run fry for all genes
+```{r}
+fry.res.D1 = fry(xglm, index = genesymbollist, des, contrast = my.contrasts[,"SORT.D1"])
+fry.res.D1 %>% filter(Direction == "Up") %>% arrange(FDR)
+fry.res.D1[fry.res.D1$FDR < 0.1,]
+
+fry.res.D2 = fry(xglm, index = genesymbollist, des, contrast = my.contrasts[,"SORT.D2"])
+fry.res.D2 %>% filter(Direction == "Up") %>% arrange(FDR)
+fry.res.D2[fry.res.D2$FDR < 0.1,]
+
+```
+
+## write gene set results to file
+```{r}
+# camera
+write.table(camera.res.D1, file = file.path(results.dir, "NIL_CHROM_D1_camera_res.csv"), sep = ",")
+write.table(camera.res.D2, file = file.path(results.dir, "NIL_CHROM_D2_camera_res.csv"), sep = ",")
+
+# roast
+write.table(roast.res.D1, file = file.path(results.dir, "NIL_CHROM_D1_roast_res.csv"), sep = ",")
+write.table(roast.res.D2, file = file.path(results.dir, "NIL_CHROM_D2_roast_res.csv"), sep = ",")
+
+# mroast
+write.table(mroast.res.D1, file = file.path(results.dir, "NIL_CHROM_D1_mroast_res.csv"), sep = ",")
+write.table(mroast.res.D2, file = file.path(results.dir, "NIL_CHROM_D2_mroast_res.csv"), sep = ",")
+
+# fry
+write.table(fry.res.D1, file = file.path(results.dir, "NIL_CHROM_D1_fry_res.csv"), sep = ",")
+write.table(fry.res.D2, file = file.path(results.dir, "NIL_CHROM_D2_fry_res.csv"), sep = ",")
+
+```
+
+## Gene set enrichment analysis - enrichR
+```{r}
+library(enrichR)
+dbs <- enrichR::listEnrichrDbs()
+dbs.to.use <- c("KEGG_2021_Human", 
+                "GO_Biological_Process_2023", 
+                "GO_Cellular_Component_2023", 
+                "GO_Molecular_Function_2023", 
+                "MSigDB_Hallmark_2020",
+                "GeneSigDB", 
+                "CORUM")
+sig.genes.24h <- rownames(camera.res.D1[camera.res.D1$FDR < 0.1 & camera.res.D1$Direction == "Up",])
+sig.genes.48h <- rownames(camera.res.D2[camera.res.D2$FDR < 0.1 & camera.res.D2$Direction == "Up",])
+
+pdf(file.path(plots.dir,"CHROM_NIL_enrichR_D1.pdf"), useDingbats = F)
+res <- enrichr(genes = sig.genes.24h, databases = dbs.to.use)
+lapply(dbs.to.use, function(x){
+  enrichR::plotEnrich(res[[as.character(x)]], title = as.character(x))
+})
+dev.off()
+
+pdf(file.path(plots.dir,"CHROM_NIL_enrichR_D2.pdf"), useDingbats = F)
+res <- enrichr(genes = sig.genes.48h, databases = dbs.to.use)
+lapply(dbs.to.use, function(x){
+  enrichR::plotEnrich(res[[as.character(x)]], title = as.character(x))
+})
+dev.off()
+
+```
+
+#------------------------------------------------
+# PLOTS
+#------------------------------------------------
+
+## get sigificant genes from camera roast mroast and fry analysis
+```{r}
+hits <- unique(
+  c(
+  rownames(camera.res.D1[camera.res.D1$FDR < 0.01,]),
+  rownames(camera.res.D2[camera.res.D2$FDR < 0.01,]),
+  
+  rownames(roast.res.D1[roast.res.D1$FDR < 0.01,]),
+  rownames(roast.res.D2[roast.res.D2$FDR < 0.01,]),
+  
+  rownames(mroast.res.D1[mroast.res.D1$FDR < 0.01,]),
+  rownames(mroast.res.D2[mroast.res.D2$FDR < 0.01,]),
+  
+  rownames(fry.res.D1[fry.res.D1$FDR < 0.01,]),
+  rownames(fry.res.D2[fry.res.D2$FDR < 0.01,])
+  )
+  )
+
+
+hits.D1 <- topTags(qlf.D1, n = Inf)[[1]] %>% rownames_to_column() %>% filter(Symbol %in% hits)
+hits.D1$timepoint <- "D1"
+hits.D2 <- topTags(qlf.D2, n = Inf)[[1]] %>% rownames_to_column() %>% filter(Symbol %in% hits)
+hits.D2$timepoint <- "D2"
+
+hits.all <- rbind(hits.D1, hits.D2)
+counts <- dge$counts
+cpm <- edgeR::cpm(dge, normalized.lib.sizes = T, log = F)
+rownames(cpm) <- dge$genes$Symbol
+
+write.table(hits.all, file = file.path(results.dir, "CHROM_NIL_hits_all_timepoints.csv"), sep = ",")
+```
+
+## plot normalised counts per timepoint per guide of significant genes
+```{r}
+pdf(file.path(plots.dir, "CHROM_NIL_norm_counts_per_guide_timepoint.pdf"))
+lapply(hits, function(x){
+  dat <- as.data.frame(cpm) %>%
+    rownames_to_column() %>% 
+    filter(grepl(as.character(x), rowname)) %>% 
+    reshape2::melt() %>% 
+    mutate(timepoint = str_split(variable, "\\.", simplify = T)[,2])
+  
+    p <- ggplot(dat, aes(y = value, x = timepoint, color = rowname, group = 1)) + 
+    geom_point() +
+    geom_smooth(method = "loess") + 
+    scale_y_continuous(trans = "log10") +
+    facet_wrap(~rowname, scales = "free_y") + 
+    labs(x = "Timepoint", y = "Log10 Counts Per Million") +
+    theme_bw()
+  return(p)
+})
+dev.off()
+```
+
+## plot log2FC per timepoint per guide of significant genes
+```{r}
+pdf(file.path(plots.dir, "CHROM_NIL_logFC_per_guide_timepoint.pdf"))
+lapply(hits, function(x){
+  dat <- as.data.frame(hits.all) %>% 
+    filter(Symbol == as.character(x)) %>% 
+    mutate(gene = paste(Symbol, Guide, sep = '.')) %>% 
+    reshape2::melt()
+  
+    p <- ggplot(dat, aes(y = value, x = timepoint, color = rowname, group = 1)) + 
+    geom_point() +
+    geom_smooth(method = "loess") + 
+    facet_wrap(~ gene, scales = "free_y") + 
+    labs(x = "Timepoint", y = "Log2 FC vs corresponding timepoint LIB control") +
+    theme_bw()
+  return(p)
+})
+dev.off()
+```
+
+## plot pct abundance per timepoint per guide of significant genes
+```{r}
+pdf(file.path(plots.dir, "CHROM_NIL_pct_per_guide_timepoint.pdf"))
+lapply(hits, function(x){
+  dat <- as.data.frame(sweep(as.data.frame(cpm), 2, colSums(as.data.frame(cpm)), `/`) * 100) %>%
+  rownames_to_column() %>% 
+  filter(grepl(as.character(x), rowname)) %>% 
+  reshape2::melt() %>% 
+  mutate(timepoint = str_split(variable, "\\.", simplify = T)[,2])
+  
+    p <- ggplot(dat, aes(y = value, x = timepoint, color = rowname, group = 1)) + 
+    geom_point() +
+    geom_smooth(method = "loess") + 
+    facet_wrap(~rowname, scales = "free_y") + 
+    labs(x = "Timepoint", y = "Percentage abundance") +
+    theme_bw()
+  return(p)
+})
+dev.off()
+
+```
+
+## Dotplots - NIL D1 - setup
+```{r}
+# merge data
+NIL.camera.D1 <- merge(camera.res.D1, roast.res.D1, by=0, all.x=TRUE)
+
+# convert FDR to -log10(FDR)
+NIL.camera.D1$LogFDR = -log10(NIL.camera.D1$FDR.x)
+
+# setup plot data
+dat <- NIL.camera.D1
+set.seed(101)
+
+# give each gene a random position on x axis
+dat$RandomIndex <- sample(1:nrow(dat), nrow(dat)) 
+
+# rank genes alphabetically
+alphabetical <- NIL.camera.D1[order(NIL.camera.D1$Row.names),]
+dat$alphabetical <- seq(1,nrow(dat))
+
+# order by significance
+dat <- dat[order(-dat$LogFDR), ]
+
+# filter positive enrichments
+pos <- dat[dat$Direction.x == "Up", ]
+pos <- pos %>% mutate(color = if_else(pos$LogFDR>2, true = "Sig", false = "NotSig"))
+
+# setup significance grouping variables
+# significant hits have -log10pval > 2 (padj < 0.01) and proportion guides positively enriched (PropUp) > 0.4
+dat <- pos %>% mutate(color = if_else(pos$LogFDR>2,true = "Sig", false = "NotSig"))
+dat$color[which(dat$PropUp < 0.4)] <- "NotSig"
+dat$label <- as.character(dat$Row.names)
+dat$label <- ifelse(dat$LogFDR>2 & dat$PropUp > 0.4 | dat$Row.names == "SF3B3" | dat$Row.names == "SF3B1", dat$label, "")
+ixlabel <- which(dat$LogFDR>2)
+dat$label[ixlabel] <- dat$Row.names[ixlabel]
+d1.pos.dat.LOW <- pos
+```
+
+## Dotplots - LO reactivation D1 - plotting
+```{r}
+ggplot(dat, aes(RandomIndex, LogFDR, label = label, size = PropUp, col = color)) + 
+  geom_point(alpha = 0.4) +
+  scale_y_continuous(trans = "log1p") +
+  scale_colour_manual(values = c("grey60", "dodgerblue2")) +
+  scale_size_continuous(breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1)) +
+  theme_bw() +
+  #ylim(c(0,3)) +
+  geom_hline(yintercept = 2, color = "black", linetype = 3) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 1000)
+ggsave(filename = "edgeR/plots/CHROM_NIL_dotplots_SORT_D1_propup.pdf", width = 4, height = 4)
+
+# alphabetical
+ggplot(dat, aes(alphabetical, LogFDR, label = label, size = PropUp, col = color)) + 
+  geom_point(alpha = 0.4) +
+  scale_y_continuous(trans = "log1p") +
+  scale_colour_manual(values = c("grey60", "dodgerblue2")) +
+  scale_size_continuous(breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1)) +
+  theme_bw() +
+  #ylim(c(0,3)) +
+  geom_hline(yintercept = 2, color = "black", linetype = 3) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 1000)
+ggsave(filename = "edgeR/plots/CHROM_NIL_dotplots_SORT_D1_propup_alphabetical.pdf", width = 4, height = 4)
+
+```
+
+## Dotplots - NIL D2 - setup
+```{r}
+# merge data
+NIL.camera.D2 <- merge(camera.res.D2, roast.res.D2, by=0, all.x=TRUE)
+
+# convert FDR to -log10(FDR)
+NIL.camera.D2$LogFDR = -log10(NIL.camera.D2$FDR.x)
+
+# setup plot data
+dat <- NIL.camera.D2
+set.seed(101)
+
+# give each gene a random position on x axis
+dat$RandomIndex <- sample(1:nrow(dat), nrow(dat)) 
+
+# rank genes alphabetically
+alphabetical <- NIL.camera.D2[order(NIL.camera.D2$Row.names),]
+dat$alphabetical <- seq(1,nrow(dat))
+
+# order by significance
+dat <- dat[order(-dat$LogFDR), ]
+
+# filter positive enrichments
+pos <- dat[dat$Direction.x == "Up", ]
+pos <- pos %>% mutate(color = if_else(pos$LogFDR>2, true = "Sig", false = "NotSig"))
+
+# setup significance grouping variables
+# significant hits have -log10pval > 2 (padj < 0.01) and proportion guides positively enriched (PropUp) > 0.4
+dat <- pos %>% mutate(color = if_else(pos$LogFDR>2,true = "Sig", false = "NotSig"))
+dat$color[which(dat$PropUp < 0.4)] <- "NotSig"
+dat$label <- as.character(dat$Row.names)
+dat$label <- ifelse(dat$LogFDR>2 & dat$PropUp > 0.4 | dat$Row.names == "SF3B3" | dat$Row.names == "SF3B1", dat$label, "")
+ixlabel <- which(dat$LogFDR>2)
+dat$label[ixlabel] <- dat$Row.names[ixlabel]
+D2.pos.dat.LOW <- pos
+```
+
+## Dotplots - LO reactivation D2 - plotting
+```{r}
+ggplot(dat, aes(RandomIndex, LogFDR, label = label, size = PropUp, col = color)) + 
+  geom_point(alpha = 0.4) +
+  scale_y_continuous(trans = "log1p") +
+  scale_colour_manual(values = c("grey60", "dodgerblue2")) +
+  scale_size_continuous(breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1)) +
+  theme_bw() +
+  #ylim(c(0,3)) +
+  geom_hline(yintercept = 2, color = "black", linetype = 3) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 1000)
+ggsave(filename = "edgeR/plots/CHROM_NIL_dotplots_SORT_D2_propup.pdf", width = 4, height = 4)
+
+# alphabetical
+ggplot(dat, aes(alphabetical, LogFDR, label = label, size = PropUp, col = color)) + 
+  geom_point(alpha = 0.4) +
+  scale_y_continuous(trans = "log1p") +
+  scale_colour_manual(values = c("grey60", "dodgerblue2")) +
+  scale_size_continuous(breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1)) +
+  theme_bw() +
+  #ylim(c(0,3)) +
+  geom_hline(yintercept = 2, color = "black", linetype = 3) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 1000)
+ggsave(filename = "edgeR/plots/CHROM_NIL_dotplots_SORT_D2_propup_alphabetical.pdf", width = 4, height = 4)
+
+```
+
+## combined timepoint dotplots
+```{r}
+# merge camera and roast results
+NIL.24h.camera <- merge(camera.res.D1, roast.res.D1, by = 0, all = T)
+NIL.24h.camera <- NIL.24h.camera %>% filter(Direction.x == "Up")
+NIL.48h.camera <- merge(camera.res.D2, roast.res.D2, by = 0, all = T)
+NIL.48h.camera <- NIL.48h.camera %>% filter(Direction.x == "Up")
+
+# convert FDR to -log10(FDR)
+NIL.24h.camera$LogFDR = -log10(NIL.24h.camera$FDR.x)
+NIL.48h.camera$LogFDR = -log10(NIL.48h.camera$FDR.x)
+
+# dotplot
+NIL.24h.camera$Timepoint = "NIL.24h"
+NIL.48h.camera$Timepoint = "NIL.48h"
+
+all.samps <- rbind(NIL.24h.camera, NIL.48h.camera)
+dat <- all.samps
+dat$RandomIndex <- sample(1:nrow(dat), nrow(dat))
+alphabetical <- NIL.24h.camera[order(NIL.24h.camera$Row.names),]
+dat$alphabetical <- seq(1,nrow(dat))
+dat <- dat[order(-dat$LogFDR), ]
+pos <- dat[dat$Direction.x == "Up", ]
+pos <- pos %>% mutate(color = if_else(pos$LogFDR>2,true = "Sig", false = "NotSig"))
+neg <- dat[dat$Direction.x == "Down", ]
+
+dat <- pos %>% mutate(color = if_else(pos$LogFDR>2,true = "Sig", false = "NotSig"))
+dat$label <- as.character(dat$Row.names)
+dat$label <- ifelse(dat$LogFDR>2 & dat$PropUp > 0.3 | dat$Row.names == "SF3B3" | dat$Row.names == "SF3B1", dat$label, "")
+ixlabel <- which(dat$LogFDR>2)
+dat$label[ixlabel] <- dat$Row.names[ixlabel] 
+
+# Dotplot
+ggplot(dat, aes(RandomIndex, LogFDR, label = label, size = PropUp, col = color)) + 
+  geom_point(alpha = 0.4) +
+  scale_y_continuous(trans = "log1p") +
+  scale_colour_manual(values = c("grey60", "dodgerblue2")) +
+  scale_size_continuous(breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1)) +
+  theme_bw() +
+  #ylim(c(0,3)) +
+  geom_hline(yintercept = 2, color = "black", linetype = 3) +
+  facet_wrap(~ Timepoint) + 
+  ggrepel::geom_text_repel(size = 4, max.overlaps = 1000)
+ggsave(filename = "./NIL_EdgeR_dotplots.pdf", width = 5.5, height = 3.5)
+```
+
+## 24 vs 48hr scatterplot
+```{r}
+dat %>% select(Row.names, LogFDR, Timepoint) %>% pivot_wider(values_from = LogFDR, names_from = Row.names, id_cols = Timepoint) %>% column_to_rownames("Timepoint") %>% t() %>% as.data.frame() %>% rownames_to_column() %>% as.tibble() %>% 
+  mutate(labs = ifelse(NIL.24h > 2 | NIL.48h > 2, rowname, "")) %>%
+  mutate(sig = ifelse(NIL.24h > 2 & NIL.48h > 2, "sig.both", ifelse(NIL.24h > 2 & NIL.48h < 2, "sig.24", 
+                             ifelse(NIL.24h < 2 & NIL.48h > 2, "sig.48", "not.sig")))) %>%
+  ggplot(aes(x = NIL.24h, y = NIL.48h, label = labs, color = sig)) + geom_point() +
+  scale_x_continuous(trans = "log1p") +
+  scale_y_continuous(trans = "log1p") +
+  geom_hline(yintercept = 2, linetype = 3) +
+  geom_vline(xintercept = 2, linetype = 3) +
+  ggrepel::geom_text_repel() + theme_classic() +
+  scale_color_manual(values = c("grey40", "red", "blue", "green"))
+ggsave(filename = "edgeR/plots/CHROM_NIL_edgeR_dotplot_24_v_48.pdf", width = 4, height = 4)
+```
+
+## Barcode plots for hits
+```{r}
+pdf(file.path(plots.dir, "CHROM_NIL_barcode_plots.pdf"), useDingbats = F)
+lapply(hits, function(x){
+  barcodeplot(qlf.D1$table$logFC, 
+              index = genesymbollist[[as.character(x)]], 
+              main = paste("Barcodeplot for", as.character(x)),
+              labels = c("Negative logFC", "Positive logFC"), quantile = c(-0.5, 0.5))
+})
+dev.off()
+```
+
+## count plots
+```{r}
+counts <- cbind(dge$genes, cpm(dge$counts))
+
+# SF3B3
+pdf("edgeR/plots/SF3B3_NIL_counts.pdf", width = 3, height = 3.5)
+
+counts <- cbind(dge$genes, cpm(dge$counts))
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.24h.NIL.LIB.R1", "CHROM.24h.NIL.SORT.R1")) %>% filter(Symbol == "SF3B3") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.48h.NIL.LIB.R1", "CHROM.48h.NIL.SORT.R1")) %>% filter(Symbol == "SF3B3") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.24h.NIL.LIB.R2", "CHROM.24h.NIL.SORT.R2")) %>% filter(Symbol == "SF3B3") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.48h.NIL.LIB.R2", "CHROM.48h.NIL.SORT.R2")) %>% filter(Symbol == "SF3B3") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+dev.off()
+
+# DDX6
+pdf("edgeR/plots/DDX6_NIL_counts.pdf", width = 3, height = 3.5)
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.24h.NIL.LIB.R1", "CHROM.24h.NIL.SORT.R1")) %>% filter(Symbol == "DDX6") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.48h.NIL.LIB.R1", "CHROM.48h.NIL.SORT.R1")) %>% filter(Symbol == "DDX6") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.24h.NIL.LIB.R2", "CHROM.24h.NIL.SORT.R2")) %>% filter(Symbol == "DDX6") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.48h.NIL.LIB.R2", "CHROM.48h.NIL.SORT.R2")) %>% filter(Symbol == "DDX6") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+dev.off()
+
+# SF3B1
+pdf("edgeR/plots/SF3B1_NIL_counts.pdf", width = 3, height = 3.5)
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.24h.NIL.LIB.R1", "CHROM.24h.NIL.SORT.R1")) %>% filter(Symbol == "SF3B1") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.48h.NIL.LIB.R1", "CHROM.48h.NIL.SORT.R1")) %>% filter(Symbol == "SF3B1") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.24h.NIL.LIB.R2", "CHROM.24h.NIL.SORT.R2")) %>% filter(Symbol == "SF3B1") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.48h.NIL.LIB.R2", "CHROM.48h.NIL.SORT.R2")) %>% filter(Symbol == "SF3B1") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+dev.off()
+
+# EIF4A3
+pdf("edgeR/plots/EIF4A3_NIL_counts.pdf", width = 3, height = 3.5)
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.24h.NIL.LIB.R1", "CHROM.24h.NIL.SORT.R1")) %>% filter(Symbol == "EIF4A3") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.48h.NIL.LIB.R1", "CHROM.48h.NIL.SORT.R1")) %>% filter(Symbol == "EIF4A3") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.24h.NIL.LIB.R2", "CHROM.24h.NIL.SORT.R2")) %>% filter(Symbol == "EIF4A3") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+counts %>% dplyr::select(c("Symbol","Guide", "CHROM.48h.NIL.LIB.R2", "CHROM.48h.NIL.SORT.R2")) %>% filter(Symbol == "EIF4A3") %>% reshape2::melt() %>% ggplot(aes(variable, value, color = Guide, group = Guide)) + geom_line() + geom_point(size = 3) + scale_y_continuous(trans = "log10") + theme_bw()
+
+dev.off()
+
+
+```
+
+## Rank plots - combined timepoints analysis
+```{r}
+# D1 group
+dat <- qlf.D1$table %>% 
+  rownames_to_column() %>% 
+  mutate(gene = str_split(rowname, "_", simplify = T)[,1]) %>%
+  group_by(gene) %>% 
+  summarise(median(logFC)) %>% 
+  arrange(desc(`median(logFC)`)) %>% mutate(rank = seq(1,length(gene)))
+dat$sig <- ifelse(dat$`median(logFC)` >= quantile(dat$`median(logFC)`, 0.9), "Enriched", ifelse(dat$`median(logFC)` <= quantile(dat$`median(logFC)`, 0.1),"Depleted", "Unchanged"))
+dat$label <- ifelse(dat$`median(logFC)` >= quantile(dat$`median(logFC)`, 0.995), dat$gene, ifelse(dat$`median(logFC)` <= quantile(dat$`median(logFC)`, 0.005),dat$gene, ""))
+
+ggplot(dat) + 
+  geom_point(aes(x = rank, y = `median(logFC)`, color = sig, label = label)) + 
+  theme_linedraw() + 
+  scale_color_manual(values = c("blue", "red", "grey80")) + 
+  ggrepel::geom_text_repel(aes(x = rank, y = `median(logFC)`, label = label), median.overlaps = 100) +
+  labs(title = "CHROM NIL - D1 - SORT fraction - Rank plot", y = "median Log2FC", x = "Gene")
+  #coord_cartesian(ylim = c(-2,4))
+ggsave(filename = "edgeR/plots/CHROM_NIL_D1_Rank_plot_median_logFC.pdf", width = 3, height = 4)
+
+# D2 group
+dat <- qlf.D2$table %>% 
+  rownames_to_column() %>% 
+  mutate(gene = str_split(rowname, "_", simplify = T)[,1]) %>%
+  group_by(gene) %>% 
+  summarise(median(logFC)) %>% 
+  arrange(desc(`median(logFC)`)) %>% mutate(rank = seq(1,length(gene)))
+dat$sig <- ifelse(dat$`median(logFC)` >= quantile(dat$`median(logFC)`, 0.9), "Enriched", ifelse(dat$`median(logFC)` <= quantile(dat$`median(logFC)`, 0.1),"Depleted", "Unchanged"))
+dat$label <- ifelse(dat$`median(logFC)` >= quantile(dat$`median(logFC)`, 0.99), dat$gene, ifelse(dat$`median(logFC)` <= quantile(dat$`median(logFC)`, 0.01),dat$gene, ""))
+
+ggplot(dat) + 
+  geom_point(aes(x = rank, y = `median(logFC)`, color = sig, label = label)) + 
+  theme_linedraw() + 
+  scale_color_manual(values = c("blue", "red", "grey80")) + 
+  ggrepel::geom_text_repel(aes(x = rank, y = `median(logFC)`, label = label), median.overlaps = 100) +
+  labs(title = "CHROM NIL - D2 - SORT fraction - Rank plot", y = "median Log2FC", x = "Gene")
+  #coord_cartesian(ylim = c(-2,4))
+ggsave(filename = "edgeR/plots/CHROM_NIL_D2_Rank_plot_median_logFC.pdf", width = 3, height = 4)
+
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
